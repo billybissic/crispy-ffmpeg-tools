@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# SQLite/runtime state
+*.db
+*.db-shm
+*.db-wal
+
+# Processing outputs / generated lists
+large-videos.txt
+first-100-paths.txt
+shrink-results.csv
+
+# Editor junk
+*.swp
+*.swo
+*~
+
+# Local media-processing artifacts
+/mnt/

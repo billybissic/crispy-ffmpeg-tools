@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "media-processing-queue"
+version = "0.2.0"
+description = "SQLite-backed queue for manually moving media files into and out of a processing directory."
+requires-python = ">=3.10"
+
+[project.scripts]
+media-queue = "media_queue.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
