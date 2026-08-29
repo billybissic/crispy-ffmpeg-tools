@@ -5,6 +5,7 @@ DB="${DB:-./media-processing.db}"
 TARGET="${TARGET:-2.5G}"
 SHRINK_SCRIPT="${SHRINK_SCRIPT:-./shrink-video.sh}"
 DURATION_TOLERANCE="${DURATION_TOLERANCE:-5}"
+ON_DURATION_MISMATCH="${ON_DURATION_MISMATCH:-stop}"
 
 usage() {
   cat <<'USAGE'
@@ -20,12 +21,18 @@ Options:
   --target SIZE           shrink-video target (default: 2.5G)
   --shrink-script PATH    shrink script (default: ./shrink-video.sh)
   --duration-tolerance S  Maximum duration difference (default: 5 seconds)
+  --on-duration-mismatch MODE
+                           stop   = stop batch, preserve files (default)
+                           skip   = mark FAILED, preserve files, continue
+                           delete = mark FAILED, delete source + rejected render, continue
   -h, --help              Show help
 
-Example:
+Examples:
   ./process-staged-batch.sh 5 91 69 88 65
+  ./process-staged-batch.sh --on-duration-mismatch delete 5 91 69 88 65
 
-The script is sequential and fail-fast. It never overwrites a destination.
+The script is sequential. Normal errors remain fail-fast. Duration mismatches
+can optionally be recorded as FAILED and skipped. It never overwrites a destination.
 USAGE
 }
 
@@ -52,6 +59,14 @@ while [[ $# -gt 0 ]]; do
     --duration-tolerance)
       [[ $# -ge 2 ]] || fail "--duration-tolerance requires a value"
       DURATION_TOLERANCE="$2"; shift 2 ;;
+    --on-duration-mismatch)
+      [[ $# -ge 2 ]] || fail "--on-duration-mismatch requires stop, skip, or delete"
+      ON_DURATION_MISMATCH="$2"
+      case "$ON_DURATION_MISMATCH" in
+        stop|skip|delete) ;;
+        *) fail "--on-duration-mismatch must be stop, skip, or delete" ;;
+      esac
+      shift 2 ;;
     -h|--help)
       usage; exit 0 ;;
     -*)
@@ -72,9 +87,11 @@ done
 echo "IDs:    ${IDS[*]}"
 echo "DB:     $DB"
 echo "Target: $TARGET"
+echo "Duration mismatch policy: $ON_DURATION_MISMATCH"
 echo
 
 passed=0
+failed_skipped=0
 
 for id in "${IDS[@]}"; do
   [[ "$id" =~ ^[0-9]+$ ]] || fail "Invalid queue ID: $id"
@@ -130,8 +147,34 @@ for id in "${IDS[@]}"; do
   echo "      rendered bytes: $rendered_bytes"
   echo "      duration delta: ${duration_diff}s"
 
-  [[ "$duration_ok" == "1" ]] || fail \
-    "Duration mismatch for item $id exceeds ${DURATION_TOLERANCE}s"
+  if [[ "$duration_ok" != "1" ]]; then
+    reason="Duration mismatch: source=${staged_duration}s output=${rendered_duration}s delta=${duration_diff}s; rejected encode"
+
+    case "$ON_DURATION_MISMATCH" in
+      stop)
+        fail "Duration mismatch for item $id exceeds ${DURATION_TOLERANCE}s"
+        ;;
+      skip|delete)
+        echo "      FAIL $id: $reason"
+        media-queue --db "$DB" mark-failed "$id" --reason "$reason" \
+          || fail "Could not mark item $id FAILED"
+
+        if [[ "$ON_DURATION_MISMATCH" == "delete" ]]; then
+          echo "      deleting corrupt/rejected files..."
+          rm -f -- "$processing_path" "$rendered_path"
+          echo "      deleted: $processing_path"
+          echo "      deleted: $rendered_path"
+        else
+          echo "      files preserved for inspection"
+        fi
+
+        ((failed_skipped+=1))
+        echo "SKIP $id"
+        echo
+        continue
+        ;;
+    esac
+  fi
 
   (( rendered_bytes < staged_bytes )) || fail \
     "Rendered output for item $id is not smaller than source"
@@ -199,5 +242,7 @@ done
 
 echo "============================================================"
 echo "BATCH COMPLETE"
-echo "Passed: $passed / ${#IDS[@]}"
+echo "Passed:         $passed"
+echo "Failed/skipped: $failed_skipped"
+echo "Total IDs:      ${#IDS[@]}"
 echo "============================================================"

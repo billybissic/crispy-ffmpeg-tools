@@ -13,6 +13,7 @@ from .service import (
     list_footprints,
     list_items,
     mark_processed,
+    mark_failed,
     move_to_processing,
     reprocess,
     reset_failed,
@@ -76,6 +77,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("reprocess", help="Reset a RETURNED item to READY_TO_MOVE")
     p.add_argument("id", type=int)
+
+    p = sub.add_parser("mark-failed", help="Mark a queue item FAILED without deleting files")
+    p.add_argument("id", type=int)
+    p.add_argument("--reason", required=True, help="Reason recorded in last_error and processing_events")
 
     p = sub.add_parser("reset-failed", help="Reset a failed item after inspection")
     p.add_argument("id", type=int)
@@ -147,6 +152,11 @@ def main() -> None:
         elif args.command == "reprocess":
             reprocess(args.db, args.id)
             print(f"Item {args.id} reset to READY_TO_MOVE for reprocessing")
+
+        elif args.command == "mark-failed":
+            mark_failed(args.db, args.id, args.reason)
+            print(f"Item {args.id} marked FAILED")
+            print(f"Reason: {args.reason}")
 
         elif args.command == "reset-failed":
             reset_failed(args.db, args.id, args.to)

@@ -500,6 +500,43 @@ def reprocess(db_path: str, queue_id: int) -> None:
             f"source={original}; size={source_size}; fingerprint={source_fp}",
         )
 
+
+def mark_failed(db_path: str, queue_id: int, reason: str) -> None:
+    """Move a queue item into the terminal FAILED state with an audit event.
+
+    This function intentionally does not delete or move files. Filesystem cleanup
+    is a separate caller decision so marking an item failed is never implicitly
+    destructive.
+    """
+    reason = reason.strip()
+    if not reason:
+        raise ValueError("Failure reason must not be empty")
+
+    with transaction(db_path) as conn:
+        row = conn.execute(
+            "SELECT status FROM processing_queue WHERE id=?",
+            (queue_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Queue item {queue_id} not found")
+        if row["status"] == "RETURNED":
+            raise ValueError(
+                f"Item {queue_id} is RETURNED; use reprocess before marking a completed item failed"
+            )
+
+        conn.execute(
+            """
+            UPDATE processing_queue
+            SET status='FAILED',
+                last_error=?,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE id=?
+            """,
+            (reason, queue_id),
+        )
+        _event(conn, queue_id, "FAILED", reason)
+
+
 def reset_failed(db_path: str, queue_id: int, status: str = "READY_TO_MOVE") -> None:
     if status not in {"READY_TO_MOVE", "IN_PROCESSING", "READY_TO_RETURN"}:
         raise ValueError("Invalid reset status")
