@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -120,7 +123,7 @@ def add_file(
             queue_id = int(existing["id"])
             # If a returned/failed path now contains different content, it is a new candidate.
             next_status = existing["status"]
-            if existing["source_fingerprint"] != fp and existing["status"] in {"RETURNED", "FAILED"}:
+            if existing["source_fingerprint"] != fp and existing["status"] in {"RETURNED", "FAILED", "SKIPPED"}:
                 next_status = "READY_TO_MOVE"
             conn.execute(
                 """
@@ -219,7 +222,75 @@ def get_item(db_path: str, queue_id: int) -> sqlite3.Row:
         return row
 
 
-def move_to_processing(db_path: str, queue_id: int) -> Path:
+
+def _claim_name(fingerprint: str) -> str:
+    # Keep filesystem names short and portable even though qfp fingerprints contain ':'.
+    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
+
+def _claim_path(claims_dir: str | Path, fingerprint: str) -> Path:
+    return Path(claims_dir).expanduser().resolve() / _claim_name(fingerprint)
+
+
+def acquire_shared_claim(
+    claims_dir: str | Path,
+    fingerprint: str,
+    *,
+    queue_id: int,
+    original_path: str,
+    pipeline: str,
+) -> tuple[bool, Path]:
+    """Atomically claim a source on shared storage.
+
+    mkdir is used as the lock primitive because directory creation is atomic on
+    the shared filesystem. Claims intentionally persist after success so stale
+    queues on other nodes cannot later reclaim already-processed sources.
+    """
+    root = Path(claims_dir).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    claim = _claim_path(root, fingerprint)
+
+    try:
+        claim.mkdir()
+    except FileExistsError:
+        return False, claim
+
+    metadata = {
+        "fingerprint": fingerprint,
+        "node": socket.gethostname(),
+        "queue_id": queue_id,
+        "pipeline": pipeline,
+        "original_path": original_path,
+    }
+    try:
+        (claim / "claim.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        # The directory itself is the authoritative claim. Metadata is diagnostic only.
+        pass
+    return True, claim
+
+
+def release_shared_claim(claim: Path) -> None:
+    """Release a claim only when staging itself failed before ownership was established."""
+    if not claim.exists():
+        return
+    try:
+        metadata = claim / "claim.json"
+        if metadata.exists():
+            metadata.unlink()
+        claim.rmdir()
+    except OSError:
+        # Never turn cleanup of a failed claim into destruction of another node's claim.
+        pass
+
+def move_to_processing(
+    db_path: str,
+    queue_id: int,
+    claims_dir: str | Path | None = None,
+) -> Path | None:
     with transaction(db_path) as conn:
         row = conn.execute("SELECT * FROM processing_queue WHERE id = ?", (queue_id,)).fetchone()
         if row is None:
@@ -229,13 +300,51 @@ def move_to_processing(db_path: str, queue_id: int) -> Path:
 
         source = Path(row["original_path"])
         destination = Path(row["processing_path"])
+        stored_fp = row["source_fingerprint"]
+
+        # In distributed mode, check/acquire the shared claim before requiring
+        # original_path to exist. This lets a stale local queue discover that
+        # another node already claimed/moved/processed the source.
+        claim: Path | None = None
+        if claims_dir:
+            if not stored_fp:
+                if not source.is_file():
+                    raise FileNotFoundError(source)
+                stored_fp = fingerprint_file(source)
+
+            acquired, claim = acquire_shared_claim(
+                claims_dir,
+                stored_fp,
+                queue_id=queue_id,
+                original_path=str(source),
+                pipeline=row["pipeline"],
+            )
+            if not acquired:
+                reason = f"Claimed by another processing node: {claim}"
+                conn.execute(
+                    """
+                    UPDATE processing_queue
+                    SET status='SKIPPED', last_error=?, updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?
+                    """,
+                    (reason, queue_id),
+                )
+                _event(conn, queue_id, "SKIPPED_CLAIMED", reason)
+                return None
+
         if not source.is_file():
+            if claim is not None:
+                release_shared_claim(claim)
             raise FileNotFoundError(source)
         if destination.exists():
+            if claim is not None:
+                release_shared_claim(claim)
             raise FileExistsError(f"Refusing to overwrite: {destination}")
 
         current_fp = fingerprint_file(source)
-        if row["source_fingerprint"] and current_fp != row["source_fingerprint"]:
+        if stored_fp and current_fp != stored_fp:
+            if claim is not None:
+                release_shared_claim(claim)
             raise ValueError("Source changed after it was queued; rescan before moving")
 
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -252,6 +361,8 @@ def move_to_processing(db_path: str, queue_id: int) -> Path:
             )
             _event(conn, queue_id, "MOVED_TO_PROCESSING", str(destination))
         except Exception as exc:
+            if claim is not None:
+                release_shared_claim(claim)
             conn.execute(
                 "UPDATE processing_queue SET status='FAILED', last_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                 (str(exc), queue_id),

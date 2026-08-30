@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -36,6 +37,11 @@ def human_size(value: int | None) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="media-queue")
     parser.add_argument("--db", default="media-processing.db", help="SQLite database path")
+    parser.add_argument(
+        "--claims-dir",
+        default=os.environ.get("MEDIA_QUEUE_CLAIMS_DIR"),
+        help="Shared claim directory for distributed queues (or MEDIA_QUEUE_CLAIMS_DIR)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="Create/upgrade the SQLite database")
@@ -53,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pipeline", default="default", help="Processing profile/footprint namespace")
 
     p = sub.add_parser("list", help="List queue items")
-    p.add_argument("--status", choices=["READY_TO_MOVE", "IN_PROCESSING", "READY_TO_RETURN", "RETURNED", "FAILED"])
+    p.add_argument("--status", choices=["READY_TO_MOVE", "IN_PROCESSING", "READY_TO_RETURN", "RETURNED", "FAILED", "SKIPPED"])
 
     p = sub.add_parser("footprints", help="List completed-file fingerprints")
     p.add_argument("--pipeline", help="Only show one processing profile")
@@ -133,7 +139,10 @@ def main() -> None:
                 print(f"{key}: {row[key]}")
 
         elif args.command == "move-to-processing":
-            path = move_to_processing(args.db, args.id)
+            path = move_to_processing(args.db, args.id, args.claims_dir)
+            if path is None:
+                print(f"SKIPPED: item {args.id} is already claimed by another processing node")
+                raise SystemExit(3)
             print(f"Moved to: {path}")
 
         elif args.command == "mark-processed":

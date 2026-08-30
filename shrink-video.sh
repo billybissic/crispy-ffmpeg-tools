@@ -75,17 +75,57 @@ while IFS= read -r bitrate; do
 done <<< "$audio_bitrates"
 
 # Calculate a video bitrate from the requested target budget.
-# Audio/subtitles are copied unchanged, so sources with very large audio tracks
-# can produce a final file larger than the requested target.
-target_total_bps=$(awk "BEGIN {printf \"%.0f\", ($target_bytes * 8) / $duration}")
-usable_bps=$(awk "BEGIN {printf \"%.0f\", $target_total_bps * 0.98}")
-video_bps=$((usable_bps - audio_total))
-video_kbps=$((video_bps / 1000))
+#
+# Audio/subtitles are copied unchanged. If the preserved audio consumes too
+# much of the requested target, automatically expand the effective target
+# enough to leave a minimum video bitrate instead of failing the batch.
+#
+# Override per node/run if desired:
+#   MIN_VIDEO_KBPS=1500 ./shrink-video.sh movie.mkv 2.5G
 
-if (( video_kbps <= 0 )); then
-  echo "Target size is too small for the preserved audio streams."
-  exit 1
+min_video_kbps="${MIN_VIDEO_KBPS:-1200}"
+min_video_bps=$((min_video_kbps * 1000))
+
+requested_target_bytes="$target_bytes"
+
+target_total_bps=$(awk "BEGIN {
+  printf \"%.0f\", ($target_bytes * 8) / $duration
+}")
+
+usable_bps=$(awk "BEGIN {
+  printf \"%.0f\", $target_total_bps * 0.98
+}")
+
+video_bps=$((usable_bps - audio_total))
+
+target_adjusted=0
+
+if (( video_bps < min_video_bps )); then
+  required_usable_bps=$((audio_total + min_video_bps))
+
+  # Reverse the 2% container/overhead allowance to determine the minimum
+  # total target bitrate, then convert that to bytes for the full duration.
+  required_total_bps=$(awk "BEGIN {
+    printf \"%.0f\", $required_usable_bps / 0.98
+  }")
+
+  target_bytes=$(awk "BEGIN {
+    printf \"%.0f\", ($required_total_bps * $duration) / 8
+  }")
+
+  target_total_bps=$(awk "BEGIN {
+    printf \"%.0f\", ($target_bytes * 8) / $duration
+  }")
+
+  usable_bps=$(awk "BEGIN {
+    printf \"%.0f\", $target_total_bps * 0.98
+  }")
+
+  video_bps=$((usable_bps - audio_total))
+  target_adjusted=1
 fi
+
+video_kbps=$((video_bps / 1000))
 
 dir="$(dirname "$input")"
 filename="$(basename "$input")"
@@ -93,6 +133,7 @@ name="${filename%.*}"
 output="$dir/${name}.${target}.H264.mkv"
 
 current_mb=$((current_bytes / 1024 / 1024))
+requested_target_mb=$((requested_target_bytes / 1024 / 1024))
 target_mb=$((target_bytes / 1024 / 1024))
 
 # Estimate final size from calculated video bitrate + preserved audio.
@@ -108,7 +149,14 @@ echo
 echo "Input:       $filename"
 echo "Resolution:  ${width}x${height}"
 echo "Current:     ${current_mb} MB"
-echo "Target:      ${target_mb} MB"
+echo "Requested:   ${requested_target_mb} MB"
+
+if (( target_adjusted )); then
+  echo "Target:      ${target_mb} MB (auto-expanded)"
+  echo "Reason:      preserved audio requires at least ${min_video_kbps} kbps for video"
+else
+  echo "Target:      ${target_mb} MB"
+fi
 echo "Audio:       ${audio_tracks} track(s)"
 echo "Audio total: $((audio_total / 1000)) kbps"
 echo "Video rate:  ${video_kbps} kbps"

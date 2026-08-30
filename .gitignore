@@ -18,6 +18,8 @@ shrink-results.csv
 *.swp
 *.swo
 *~
+.idea/
+*.bak
 
 # Local media-processing artifacts
 /mnt/

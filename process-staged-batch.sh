@@ -6,6 +6,7 @@ TARGET="${TARGET:-2.5G}"
 SHRINK_SCRIPT="${SHRINK_SCRIPT:-./shrink-video.sh}"
 DURATION_TOLERANCE="${DURATION_TOLERANCE:-5}"
 ON_DURATION_MISMATCH="${ON_DURATION_MISMATCH:-stop}"
+ON_EXISTING_OUTPUT="${ON_EXISTING_OUTPUT:-recover}"
 
 usage() {
   cat <<'USAGE'
@@ -59,6 +60,14 @@ while [[ $# -gt 0 ]]; do
     --duration-tolerance)
       [[ $# -ge 2 ]] || fail "--duration-tolerance requires a value"
       DURATION_TOLERANCE="$2"; shift 2 ;;
+    --on-existing-output)
+      [[ $# -ge 2 ]] || fail "--on-existing-output requires recover or stop"
+      ON_EXISTING_OUTPUT="$2"
+      case "$ON_EXISTING_OUTPUT" in
+        recover|stop) ;;
+        *) fail "--on-existing-output must be recover or stop" ;;
+      esac
+      shift 2 ;;
     --on-duration-mismatch)
       [[ $# -ge 2 ]] || fail "--on-duration-mismatch requires stop, skip, or delete"
       ON_DURATION_MISMATCH="$2"
@@ -88,6 +97,7 @@ echo "IDs:    ${IDS[*]}"
 echo "DB:     $DB"
 echo "Target: $TARGET"
 echo "Duration mismatch policy: $ON_DURATION_MISMATCH"
+echo "Existing output policy: $ON_EXISTING_OUTPUT"
 echo
 
 passed=0
@@ -117,9 +127,152 @@ for id in "${IDS[@]}"; do
     -of default=noprint_wrappers=1:nokey=1 \
     "$processing_path")" || fail "Could not read duration: $processing_path"
 
+  
+  staged_dir="$(dirname "$processing_path")"
+  staged_filename="$(basename "$processing_path")"
+  staged_name="${staged_filename%.*}"
+
+  rendered_path="$staged_dir/${staged_name}.${TARGET}.H264.mkv"
+  rendered_basename="$(basename "$rendered_path")"
+  expected_destination="$source_dir/$rendered_basename"
+
+  #
+  # RECOVERY:
+  # A previous/interrupted pipeline run may have already returned a valid
+  # rendered file while leaving the original source IN_PROCESSING.
+  #
+  # If that destination exists, validate it before wasting time re-encoding.
+  #
+  if [[ -e "$expected_destination" ]]; then
+    echo
+    echo "[RECOVERY] Existing destination detected:"
+    echo "           $expected_destination"
+
+    [[ "$ON_EXISTING_OUTPUT" == "recover" ]] || fail \
+      "Destination already exists; refusing to overwrite: $expected_destination"
+
+    [[ -f "$expected_destination" ]] || fail \
+      "Existing destination is not a regular file: $expected_destination"
+
+    existing_duration="$(ffprobe -v error \
+      -show_entries format=duration \
+      -of default=noprint_wrappers=1:nokey=1 \
+      "$expected_destination")" || fail \
+      "Could not read existing destination duration: $expected_destination"
+
+    existing_diff="$(awk \
+      -v a="$staged_duration" \
+      -v b="$existing_duration" \
+      'BEGIN {d=a-b; if(d<0)d=-d; printf "%.3f", d}')"
+
+    existing_ok="$(awk \
+      -v d="$existing_diff" \
+      -v t="$DURATION_TOLERANCE" \
+      'BEGIN {print (d<=t)?1:0}')"
+
+    echo "           source duration:   ${staged_duration}s"
+    echo "           existing duration: ${existing_duration}s"
+    echo "           duration delta:    ${existing_diff}s"
+
+    #
+    # Do NOT automatically delete or replace mismatched files.
+    #
+    if [[ "$existing_ok" != "1" ]]; then
+      fail \
+        "Existing destination duration mismatch for item $id; both files preserved"
+    fi
+
+    existing_bytes="$(stat -c%s "$expected_destination")"
+
+    (( existing_bytes < staged_bytes )) || fail \
+      "Existing destination is not smaller than source; both files preserved"
+
+    #
+    # If another rendered sidecar is already sitting in processing, this is
+    # ambiguous. Preserve everything rather than choosing one automatically.
+    #
+    [[ ! -e "$rendered_path" ]] || fail \
+      "Recovery render already exists in processing directory: $rendered_path"
+
+    echo "           VALID existing render."
+    echo "           Reusing instead of encoding."
+    echo
+
+    echo "[1/3] Moving existing render back into processing..."
+    mv -- "$expected_destination" "$rendered_path" \
+      || fail "Could not move existing render into processing directory"
+
+    echo "[2/3] Adopting recovered render..."
+    if ! media-queue --db "$DB" adopt-output "$id" "$rendered_path"; then
+
+      # Best-effort rollback if DB adoption fails.
+      if [[ -f "$rendered_path" && ! -e "$expected_destination" ]]; then
+        mv -- "$rendered_path" "$expected_destination" || true
+      fi
+
+      fail "adopt-output failed during recovery for item $id"
+    fi
+
+    echo "[3/3] Returning recovered render..."
+    media-queue --db "$DB" return-file "$id" \
+      || fail "return-file failed during recovery for item $id"
+
+    recovered_item="$(media-queue --db "$DB" show "$id")" \
+      || fail "Could not verify recovered item $id"
+
+    recovered_status="$(awk -F': ' \
+      '$1=="status" {print $2; exit}' <<<"$recovered_item")"
+
+    recovered_path="$(awk -F': ' \
+      '$1=="original_path" {
+        sub(/^original_path: /,"");
+        print;
+        exit
+      }' <<<"$recovered_item")"
+
+    [[ "$recovered_status" == "RETURNED" ]] || fail \
+      "Item $id is $recovered_status after recovery; expected RETURNED"
+
+    [[ "$recovered_path" == "$expected_destination" ]] || fail \
+      "Recovered destination mismatch for item $id"
+
+    [[ -f "$recovered_path" ]] || fail \
+      "Recovered output missing: $recovered_path"
+
+    recovered_duration="$(ffprobe -v error \
+      -show_entries format=duration \
+      -of default=noprint_wrappers=1:nokey=1 \
+      "$recovered_path")" || fail \
+      "Could not verify recovered duration"
+
+    recovered_diff="$(awk \
+      -v a="$staged_duration" \
+      -v b="$recovered_duration" \
+      'BEGIN {d=a-b; if(d<0)d=-d; printf "%.3f", d}')"
+
+    recovered_ok="$(awk \
+      -v d="$recovered_diff" \
+      -v t="$DURATION_TOLERANCE" \
+      'BEGIN {print (d<=t)?1:0}')"
+
+    [[ "$recovered_ok" == "1" ]] || fail \
+      "Recovered destination duration mismatch for item $id"
+
+    echo
+    echo "RECOVERED $id"
+    echo "  returned: $recovered_path"
+    echo "  size:     $existing_bytes bytes"
+    echo "  duration delta: ${recovered_diff}s"
+    echo
+
+    ((passed+=1))
+    continue
+  fi
+  
   echo "Source: $processing_path"
   echo "Home:   $source_dir"
   echo
+
   echo "[1/5] Encoding..."
 
   "$SHRINK_SCRIPT" "$processing_path" "$TARGET" || fail "Encoder failed for item $id"
@@ -178,9 +331,6 @@ for id in "${IDS[@]}"; do
 
   (( rendered_bytes < staged_bytes )) || fail \
     "Rendered output for item $id is not smaller than source"
-
-  rendered_basename="$(basename "$rendered_path")"
-  expected_destination="$source_dir/$rendered_basename"
 
   # Preserve the no-overwrite contract before adopt-output removes the staged source.
   [[ ! -e "$expected_destination" ]] || fail \
