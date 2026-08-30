@@ -1,225 +1,576 @@
-# Media Processing Queue Starter
+# Running the Media Processing Pipeline
 
-A small SQLite-backed service/CLI for staging media files into a processing directory and returning them afterward.
+This project provides a distributed FFmpeg processing pipeline backed by a local SQLite queue on each worker node.
 
-## Design for this version
+Each node operates independently:
 
-- SQLite owns queue state, audit history, and completed-file footprints.
-- Scanning/adding files does **not** move anything.
-- File movement only happens through explicit CLI commands.
-- Processing itself is external for now (FFmpeg scripts, HandBrake, etc.).
-- No daemon, watcher, cron, or automatic movement yet.
-- Moves refuse to overwrite an existing destination.
-- Successfully returned files leave a persistent content footprint so future scans do not encode them again.
+* its own `media-processing.db`
+* its own processing directory
+* its own FFmpeg process
+* its own queue state
 
-## Status flow
+Nodes coordinate through a shared claim directory located on the shared media filesystem. The claim system prevents multiple workers from processing the same source file at the same time.
+
+---
+
+## Pipeline Overview
+
+Normal file lifecycle:
 
 ```text
 READY_TO_MOVE
-    |  media-queue move-to-processing ID
-    v
+    ↓
 IN_PROCESSING
-    |  external processing + media-queue mark-processed ID
-    v
+    ↓
 READY_TO_RETURN
-    |  media-queue return-file ID
-    v
-RETURNED + footprint recorded
+    ↓
+RETURNED
 ```
 
-Any move failure is recorded as `FAILED` with `last_error` and an audit event.
+Other terminal states:
 
-## Footprints: avoiding repeat encodes
+```text
+FAILED
+SKIPPED
+```
 
-The service creates a fast fingerprint from:
+`SKIPPED` is normally used when another processing node has already claimed a source file.
 
-- exact file size
-- SHA-256 over samples from the beginning, middle, and end of the file
+A typical processing cycle is:
 
-Only a few MiB are read even for very large media files. The fingerprint is stored in the `processed_files` ledger after a successful return.
+```text
+scan media library
+    ↓
+queue eligible files
+    ↓
+claim source
+    ↓
+move source into node processing directory
+    ↓
+encode with FFmpeg
+    ↓
+verify output duration
+    ↓
+verify output is smaller
+    ↓
+adopt rendered output
+    ↓
+return rendered file to original directory
+```
 
-On later scans, an identical file is skipped even if it has been renamed or moved.
+---
 
-Footprints are **pipeline-aware**. Use a stable pipeline name for a particular processing recipe:
+# Requirements
+
+The worker must have:
+
+```text
+Python 3.10+
+FFmpeg
+ffprobe
+SQLite
+Git
+```
+
+Ubuntu/Debian:
 
 ```bash
---pipeline shrink-h264-v1
+sudo apt update
+sudo apt install -y ffmpeg sqlite3 python3 python3-venv git
 ```
 
-A file completed under `shrink-h264-v1` will be skipped on later `shrink-h264-v1` scans, but it can still be queued for a genuinely different pipeline such as `widescreen-v1`.
+Verify FFmpeg:
 
-## Install for development
+```bash
+ffmpeg -version | head -n 1
+ffprobe -version | head -n 1
+```
+
+---
+
+# Clone the Repository
+
+```bash
+git clone git@github.com:billybissic/crispy-ffmpeg-tools.git
+cd crispy-ffmpeg-tools
+```
+
+---
+
+# Python Installation
+
+## Ubuntu 22.04 / User Installation
+
+If the system Python allows user installs:
+
+```bash
+python3 -m pip install .
+```
+
+After future Git updates:
+
+```bash
+git pull --ff-only
+python3 -m pip install --no-cache-dir .
+```
+
+---
+
+## Ubuntu 24.04 / Virtual Environment
+
+Ubuntu 24.04 may prevent installing packages directly into the system Python environment.
+
+Create a virtual environment:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e .
 ```
 
-## Initialize
+Install the project:
+
+```bash
+python -m pip install .
+```
+
+For future sessions:
+
+```bash
+cd ~/projects/crispy-ffmpeg-tools
+source .venv/bin/activate
+```
+
+After updates:
+
+```bash
+git pull --ff-only
+source .venv/bin/activate
+python -m pip install .
+```
+
+---
+
+# Configure the Shared Claims Directory
+
+All worker nodes must use a claim directory that resolves to the same physical shared filesystem.
+
+Example physical layout:
+
+```text
+media/
+└── processing/
+    ├── .claims/
+    ├── mini-dev/
+    ├── mini-nas/
+    └── mini-nas-two/
+```
+
+Create the claim directory:
+
+```bash
+mkdir -p /path/to/shared/media/processing/.claims
+```
+
+Set:
+
+```bash
+export MEDIA_QUEUE_CLAIMS_DIR=/path/to/shared/media/processing/.claims
+```
+
+To make it persistent:
+
+```bash
+echo 'export MEDIA_QUEUE_CLAIMS_DIR=/path/to/shared/media/processing/.claims' >> ~/.bashrc
+source ~/.bashrc
+```
+
+Verify:
+
+```bash
+echo "$MEDIA_QUEUE_CLAIMS_DIR"
+```
+
+### Example Node Paths
+
+Different workers may mount the same physical directory at different paths.
+
+Example:
+
+```text
+mini-dev
+/mnt/rdisk/processing/.claims
+
+mini-nas
+/mnt/rdisk/media/processing/.claims
+
+mini-nas-two
+/mnt/rdisk-remote/media/processing/.claims
+```
+
+These paths must all resolve to the same physical `.claims` directory.
+
+---
+
+# Create the Node Processing Directory
+
+Each worker must have its own isolated processing directory.
+
+Example:
+
+```bash
+mkdir -p /mnt/rdisk/media/processing/mini-nas
+```
+
+or:
+
+```bash
+mkdir -p /mnt/rdisk-remote/media/processing/mini-nas-two
+```
+
+Do not allow multiple nodes to use the same processing directory.
+
+---
+
+# Initialize the Queue Database
+
+Each node maintains its own local SQLite database.
+
+From the project directory:
 
 ```bash
 media-queue --db ./media-processing.db init
 ```
 
-## Queue one file (no movement)
+This also performs supported database schema upgrades.
 
-```bash
-media-queue --db ./media-processing.db add \
-  "/mnt/rdisk/Movies/movie.mkv" \
-  --processing-dir "/mnt/processing" \
-  --pipeline shrink-h264-v1
-```
+---
 
-## Scan a directory
+# Scan the Media Library
 
-Queue media at least 4 GiB:
+Example:
 
 ```bash
 media-queue --db ./media-processing.db scan \
-  /mnt/rdisk/Movies \
-  --processing-dir /mnt/processing \
-  --min-size-gb 4 \
+  "/mnt/rdisk/media/Movies" \
+  --processing-dir /mnt/rdisk/media/processing/mini-nas \
+  --min-size-gb 10 \
   --pipeline shrink-h264-v1
 ```
 
-Example result on a later pass:
+Example output:
 
 ```text
-Queued/updated: 12; already processed: 83; skipped/errors: 0
+Queued/updated: 94; already processed: 0; skipped/errors: 0
 ```
 
-Default extensions:
+The scan only populates the local node queue.
 
-```text
-.mkv .mp4 .avi .m4v .mov .wmv .ts .m2ts
-```
+It does not assign ownership of a file.
 
-## Inspect the queue
+Ownership happens when `move-to-processing` successfully acquires the shared claim.
+
+---
+
+# Inspect the Queue
+
+Ready files:
 
 ```bash
-media-queue --db ./media-processing.db list
 media-queue --db ./media-processing.db list --status READY_TO_MOVE
-media-queue --db ./media-processing.db show 12
 ```
 
-Inspect completed footprints:
+Currently staged:
+
+```bash
+media-queue --db ./media-processing.db list --status IN_PROCESSING
+```
+
+Completed:
+
+```bash
+media-queue --db ./media-processing.db list --status RETURNED
+```
+
+Skipped because another node claimed them:
+
+```bash
+media-queue --db ./media-processing.db list --status SKIPPED
+```
+
+Failed:
+
+```bash
+media-queue --db ./media-processing.db list --status FAILED
+```
+
+---
+
+# Stage Files for Processing
+
+A worker should attempt queue candidates until the desired number of files are actually staged.
+
+Do not simply select 20 IDs and assume all 20 will be available.
+
+Another node may already own some of them.
+
+Example: fill the worker to 20 staged files.
+
+```bash
+target=20
+
+count=$(media-queue --db ./media-processing.db list --status IN_PROCESSING \
+  | awk 'NR>1 {count++} END {print count+0}')
+
+echo "Already staged: $count/$target"
+
+while IFS= read -r id; do
+  [[ "$count" -ge "$target" ]] && break
+
+  media-queue --db ./media-processing.db move-to-processing "$id" || true
+
+  status=$(sqlite3 ./media-processing.db \
+    "SELECT status FROM processing_queue WHERE id=$id;")
+
+  if [[ "$status" == "IN_PROCESSING" ]]; then
+    ((count++))
+    echo "STAGED $id ($count/$target)"
+  fi
+
+done < <(
+  media-queue --db ./media-processing.db list --status READY_TO_MOVE \
+    | awk 'NR>1 {print $1}'
+)
+```
+
+Claim collisions are expected in a distributed environment.
+
+Example:
+
+```text
+SKIPPED: item 38 is already claimed by another processing node
+```
+
+The local queue item is marked:
+
+```text
+SKIPPED
+```
+
+and the worker continues without touching the source.
+
+---
+
+# Start the Processing Batch
+
+Run all currently staged files:
+
+```bash
+./process-staged-batch.sh \
+  --on-duration-mismatch skip \
+  $(media-queue --db ./media-processing.db list --status IN_PROCESSING \
+    | awk 'NR>1 {print $1}')
+```
+
+The worker processes files sequentially.
+
+A larger staged queue therefore increases unattended runtime without increasing the number of simultaneous FFmpeg encodes on that worker.
+
+---
+
+# Duration Mismatch Behavior
+
+The batch processor supports:
+
+```text
+--on-duration-mismatch stop
+--on-duration-mismatch skip
+--on-duration-mismatch delete
+```
+
+Recommended distributed-worker behavior:
+
+```bash
+--on-duration-mismatch skip
+```
+
+With `skip`:
+
+* the queue item becomes `FAILED`
+* the source and rejected render are preserved
+* the failure is displayed in the terminal
+* later IDs continue processing
+
+Example:
+
+```text
+FAIL 136: Duration mismatch
+files preserved for inspection
+SKIP 136
+```
+
+---
+
+# Shared Claim Behavior
+
+Before moving a source file into a processing directory, the worker creates an atomic shared claim based on the source fingerprint.
+
+Conceptually:
+
+```text
+READY_TO_MOVE
+      ↓
+calculate source fingerprint
+      ↓
+attempt shared claim
+      ↓
+┌───────────────┬─────────────────────┐
+│ claim success │ claim already exists│
+└───────┬───────┴──────────┬──────────┘
+        ↓                  ↓
+IN_PROCESSING          SKIPPED
+```
+
+Claims intentionally remain after successful processing.
+
+This prevents an old or stale queue database on another worker from later processing the same original source.
+
+Local queue IDs are node-specific and are not used as cluster-wide identifiers.
+
+The shared source fingerprint is the distributed identity.
+
+---
+
+# Updating a Worker Node
+
+Do not update a node while it is actively processing a batch.
+
+Allow the active batch to finish first.
+
+Then:
+
+```bash
+cd ~/projects/crispy-ffmpeg-tools
+git pull --ff-only
+```
+
+For a normal Python installation:
+
+```bash
+python3 -m pip install --no-cache-dir .
+```
+
+For a virtual environment:
+
+```bash
+source .venv/bin/activate
+python -m pip install .
+```
+
+Upgrade/validate the database:
+
+```bash
+media-queue --db ./media-processing.db init
+```
+
+Verify claims:
+
+```bash
+echo "$MEDIA_QUEUE_CLAIMS_DIR"
+```
+
+Verify CLI:
+
+```bash
+media-queue --help
+```
+
+Run tests when appropriate:
+
+```bash
+python3 -m pytest
+```
+
+---
+
+# Useful Queue Commands
+
+Show one queue item:
+
+```bash
+media-queue --db ./media-processing.db show 42
+```
+
+Mark a known bad source as failed:
+
+```bash
+media-queue --db ./media-processing.db mark-failed 42 \
+  --reason "Source file corrupt"
+```
+
+Reset an inspected failed item:
+
+```bash
+media-queue --db ./media-processing.db reset-failed 42
+```
+
+List processed fingerprints:
 
 ```bash
 media-queue --db ./media-processing.db footprints
-media-queue --db ./media-processing.db footprints --pipeline shrink-h264-v1
 ```
 
-## Explicit movement commands
+---
 
-Move one file into processing:
+# Operational Safety
 
-```bash
-media-queue --db ./media-processing.db move-to-processing 12
-```
+The pipeline intentionally favors safety over silently continuing.
 
-After your external FFmpeg/HandBrake workflow finishes:
+Important safeguards include:
 
-```bash
-media-queue --db ./media-processing.db mark-processed 12
-```
+* no silent destination overwrite
+* source fingerprint validation
+* persistent completed-file fingerprints
+* shared distributed claims
+* duration verification
+* output-size verification
+* isolated processing directories
+* local queue audit history
+* explicit `FAILED` state
+* explicit `SKIPPED` state
 
-This fingerprints the processed file while it is still in the processing directory.
+If a move, encode, verification, or return operation behaves unexpectedly, inspect the queue record before manually moving or deleting files.
 
-Return it to its original path:
+---
 
-```bash
-media-queue --db ./media-processing.db return-file 12
-```
-
-The return command verifies the processed file has not changed since `mark-processed`, moves it back, and records the permanent footprint.
-
-## Safety checks
-
-- A queued source is fingerprinted before movement. If it changes between scan and move, movement is refused and you must rescan.
-- A processed file is fingerprinted by `mark-processed`. If it changes before return, return is refused until it is marked again.
-- Existing destination files are never overwritten.
-- Completed footprints survive repeated scans and path renames as long as the SQLite database is retained.
-
-## Failure recovery
-
-Inspect first:
-
-```bash
-media-queue --db ./media-processing.db show 12
-```
-
-Then reset only after deciding which state is correct:
-
-```bash
-media-queue --db ./media-processing.db reset-failed 12 --to READY_TO_MOVE
-```
-
-## SQLite tables
-
-### `processing_queue`
-
-Important columns:
-
-- `original_path`
-- `processing_path`
-- `pipeline`
-- `status`
-- `original_size_bytes`
-- `source_fingerprint`
-- `final_fingerprint`
-- timestamps for move/process/return
-- `last_error`
-
-### `processed_files`
-
-Permanent completed-file ledger:
-
-- `pipeline`
-- `fingerprint`
-- last known `path`
-- final `size_bytes`
-- source `queue_id`
-- processed/last-seen timestamps
-
-### `processing_events`
-
-Append-only audit trail for queue and movement events.
-
-## Next steps after manual testing
-
-1. Add `move-ready --limit 1`, then `--limit 10`, then `--all`.
-2. Output duration/codec verification before `mark-processed`.
-3. Automatic move worker after the manual workflow is proven.
-4. Processor command integration.
-5. Automatic return worker.
-6. Retry policy and stale-job recovery.
-
-## Rendered filename return behavior
-
-When an external renderer creates a sidecar such as:
+# Current Distributed Architecture
 
 ```text
-/mnt/processing/movie.2.5G.H264.mkv
+Shared Media RAID
+│
+├── Movies/
+│
+└── processing/
+    ├── .claims/
+    ├── mini-dev/
+    ├── mini-nas/
+    └── mini-nas-two/
+
+mini-dev
+├── local media-processing.db
+├── media-queue
+└── FFmpeg worker
+
+mini-nas
+├── local media-processing.db
+├── media-queue
+└── FFmpeg worker
+
+mini-nas-two
+├── local media-processing.db
+├── media-queue
+└── FFmpeg worker
 ```
 
-adopt it with:
+The SQLite databases remain independent.
 
-```bash
-media-queue --db ./media-processing.db adopt-output 23 \
-  /mnt/processing/movie.2.5G.H264.mkv
-```
-
-`adopt-output` validates the duration, removes the staged source copy, preserves the rendered basename, and updates the queue's processing path. A subsequent:
-
-```bash
-media-queue --db ./media-processing.db return-file 23
-```
-
-returns the file to the original directory as:
-
-```text
-<original-directory>/movie.2.5G.H264.mkv
-```
-
-The command refuses to overwrite an existing destination file. After return, the queue's `original_path` is updated to the rendered file's actual returned path so `reprocess` operates on the current library file.
+The shared `.claims` directory coordinates distributed file ownership.
