@@ -23,9 +23,12 @@ Options:
   --shrink-script PATH    shrink script (default: ./shrink-video.sh)
   --duration-tolerance S  Maximum duration difference (default: 5 seconds)
   --on-duration-mismatch MODE
-                           stop   = stop batch, preserve files (default)
-                           skip   = mark FAILED, preserve files, continue
-                           delete = mark FAILED, delete source + rejected render, continue
+                          stop   = stop batch, preserve files (default)
+                          skip   = mark FAILED, preserve files, continue
+                          delete = mark FAILED, delete source + rejected render, continue
+  --on-existing-output MODE
+                           recover = reuse valid existing render (default)
+                           stop    = stop if destination already exists
   -h, --help              Show help
 
 Examples:
@@ -87,7 +90,7 @@ done
 
 (( ${#IDS[@]} > 0 )) || { usage; exit 2; }
 
-for cmd in media-queue ffprobe stat awk dirname basename; do
+for cmd in media-queue ffprobe stat awk dirname basename mv; do
   command -v "$cmd" >/dev/null 2>&1 || fail "Missing required command: $cmd"
 done
 
@@ -101,6 +104,7 @@ echo "Existing output policy: $ON_EXISTING_OUTPUT"
 echo
 
 passed=0
+recovered=0
 failed_skipped=0
 
 for id in "${IDS[@]}"; do
@@ -127,7 +131,6 @@ for id in "${IDS[@]}"; do
     -of default=noprint_wrappers=1:nokey=1 \
     "$processing_path")" || fail "Could not read duration: $processing_path"
 
-  
   staged_dir="$(dirname "$processing_path")"
   staged_filename="$(basename "$processing_path")"
   staged_name="${staged_filename%.*}"
@@ -266,9 +269,10 @@ for id in "${IDS[@]}"; do
     echo
 
     ((passed+=1))
+    ((recovered+=1))
     continue
   fi
-  
+
   echo "Source: $processing_path"
   echo "Home:   $source_dir"
   echo
@@ -276,11 +280,6 @@ for id in "${IDS[@]}"; do
   echo "[1/5] Encoding..."
 
   "$SHRINK_SCRIPT" "$processing_path" "$TARGET" || fail "Encoder failed for item $id"
-
-  staged_dir="$(dirname "$processing_path")"
-  staged_filename="$(basename "$processing_path")"
-  staged_name="${staged_filename%.*}"
-  rendered_path="$staged_dir/${staged_name}.${TARGET}.H264.mkv"
 
   [[ -f "$rendered_path" ]] || fail "Expected rendered output not found: $rendered_path"
 
@@ -393,6 +392,7 @@ done
 echo "============================================================"
 echo "BATCH COMPLETE"
 echo "Passed:         $passed"
+echo "Recovered:      $recovered"
 echo "Failed/skipped: $failed_skipped"
 echo "Total IDs:      ${#IDS[@]}"
 echo "============================================================"
