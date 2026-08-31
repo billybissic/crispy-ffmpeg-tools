@@ -168,15 +168,38 @@ echo
 echo "--------------------------------------------------"
 echo
 
+subtitle_args=()
+subtitle_index=0
+
+while IFS= read -r codec; do
+  [[ -z "$codec" ]] && continue
+
+  subtitle_args+=(-map "0:s:${subtitle_index}?")
+
+  if [[ "$codec" == "mov_text" ]]; then
+    subtitle_args+=(-c:s:${subtitle_index} srt)
+  else
+    subtitle_args+=(-c:s:${subtitle_index} copy)
+  fi
+
+  ((subtitle_index++))
+done < <(
+  ffprobe -v error \
+    -select_streams s \
+    -show_entries stream=codec_name \
+    -of default=noprint_wrappers=1:nokey=1 \
+    "$input"
+)
+
 ffmpeg -i "$input" \
   -map 0:v \
   -map 0:a? \
-  -map 0:s? \
+  "${subtitle_args[@]}" \
   -map_metadata 0 \
   -map_chapters 0 \
+  -vf "pad=ceil(iw/2)*2:ceil(ih/2)*2" \
   -c:v libx264 \
   -b:v "${video_kbps}k" \
   -preset slow \
   -c:a copy \
-  -c:s copy \
   "$output"
