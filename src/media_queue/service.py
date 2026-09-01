@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .db import connect, init_db, transaction
+from .metadata import store_probe_snapshot, update_media_asset_location
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts", ".m2ts"}
 FINGERPRINT_SAMPLE_SIZE = 1024 * 1024
@@ -187,6 +188,153 @@ def scan_directory(
     return queued, already_processed, skipped_errors
 
 
+
+def probe_scan_directory(
+    db_path: str,
+    root: str,
+    min_size_bytes: int = 0,
+    extensions: Iterable[str] = VIDEO_EXTENSIONS,
+) -> tuple[int, int, int]:
+    """Non-destructively fingerprint/probe matching media without queueing or moving it.
+
+    Returns (captured, already_captured, errors). The processing_queue is never
+    inserted into or updated by this operation.
+    """
+    init_db(db_path)
+    root_path = Path(root).expanduser().resolve()
+    if not root_path.is_dir():
+        raise NotADirectoryError(root_path)
+
+    allowed = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in extensions}
+    captured = 0
+    already_captured = 0
+    errors = 0
+
+    for path in root_path.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in allowed:
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            errors += 1
+            continue
+        if size < min_size_bytes:
+            continue
+
+        try:
+            fp = fingerprint_file(path)
+            with transaction(db_path) as conn:
+                existing = conn.execute(
+                    """
+                    SELECT s.id
+                    FROM media_probe_snapshots s
+                    JOIN media_assets a ON a.id=s.media_asset_id
+                    WHERE s.stage='SOURCE'
+                      AND s.fingerprint=?
+                      AND a.original_path=?
+                    ORDER BY s.id DESC LIMIT 1
+                    """,
+                    (fp, str(path)),
+                ).fetchone()
+                if existing is not None:
+                    already_captured += 1
+                    continue
+
+                store_probe_snapshot(
+                    conn,
+                    queue_id=None,
+                    path=path,
+                    fingerprint=fp,
+                    stage="SOURCE",
+                    source_fingerprint=fp,
+                )
+                captured += 1
+        except (OSError, sqlite3.Error, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
+            errors += 1
+
+    return captured, already_captured, errors
+
+def probe_queue_items(
+    db_path: str,
+    *,
+    status: str = "READY_TO_MOVE",
+    limit: int | None = None,
+    queue_ids: Iterable[int] | None = None,
+) -> tuple[int, int, int]:
+    """Non-destructively collect SOURCE metadata for files already represented in the queue.
+
+    Queue status, paths, and timestamps are never changed. Returns
+    (captured, already_captured, errors). When queue_ids is supplied, only those
+    IDs are considered; otherwise rows are selected by status in the same size-first
+    order used by the normal queue listing.
+    """
+    init_db(db_path)
+    captured = 0
+    already_captured = 0
+    errors = 0
+
+    with connect(db_path) as conn:
+        if queue_ids is not None:
+            ids = [int(value) for value in queue_ids]
+            if not ids:
+                return 0, 0, 0
+            placeholders = ",".join("?" for _ in ids)
+            rows = conn.execute(
+                f"SELECT * FROM processing_queue WHERE id IN ({placeholders}) ORDER BY original_size_bytes DESC, id",
+                ids,
+            ).fetchall()
+        else:
+            sql = "SELECT * FROM processing_queue WHERE status=? ORDER BY original_size_bytes DESC, id"
+            params: list[object] = [status]
+            rows = conn.execute(sql, params).fetchall()
+
+    for row in rows:
+        if limit is not None and captured >= limit:
+            break
+        path = Path(row["original_path"]).expanduser().resolve()
+        try:
+            if not path.is_file():
+                errors += 1
+                continue
+
+            fp = row["source_fingerprint"] or fingerprint_file(path)
+            current_fp = fingerprint_file(path)
+            if current_fp != fp:
+                errors += 1
+                continue
+
+            with transaction(db_path) as conn:
+                existing = conn.execute(
+                    """
+                    SELECT s.id
+                    FROM media_probe_snapshots s
+                    JOIN media_assets a ON a.id=s.media_asset_id
+                    WHERE s.stage='SOURCE'
+                      AND s.fingerprint=?
+                      AND a.queue_id=?
+                    ORDER BY s.id DESC LIMIT 1
+                    """,
+                    (fp, int(row["id"])),
+                ).fetchone()
+                if existing is not None:
+                    already_captured += 1
+                    continue
+
+                store_probe_snapshot(
+                    conn,
+                    queue_id=int(row["id"]),
+                    path=path,
+                    fingerprint=fp,
+                    stage="SOURCE",
+                    source_fingerprint=fp,
+                )
+                captured += 1
+        except (OSError, sqlite3.Error, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
+            errors += 1
+
+    return captured, already_captured, errors
+
+
 def list_items(db_path: str, status: str | None = None) -> list[sqlite3.Row]:
     init_db(db_path)
     with connect(db_path) as conn:
@@ -347,6 +495,23 @@ def move_to_processing(
                 release_shared_claim(claim)
             raise ValueError("Source changed after it was queued; rescan before moving")
 
+        # Capture the source while it is still intact. A probe failure is treated
+        # as a staging failure, and any just-acquired distributed claim is
+        # released so another node is not blocked by a stale claim.
+        try:
+            store_probe_snapshot(
+                conn,
+                queue_id=queue_id,
+                path=source,
+                fingerprint=current_fp,
+                stage="SOURCE",
+                source_fingerprint=stored_fp or current_fp,
+            )
+        except Exception:
+            if claim is not None:
+                release_shared_claim(claim)
+            raise
+
         destination.parent.mkdir(parents=True, exist_ok=True)
         try:
             shutil.move(str(source), str(destination))
@@ -433,6 +598,9 @@ def return_file(db_path: str, queue_id: int) -> Path:
                 WHERE id=?
                 """,
                 (str(destination), final_fp, queue_id),
+            )
+            update_media_asset_location(
+                conn, queue_id=queue_id, path=destination, fingerprint=final_fp
             )
             conn.execute(
                 """
@@ -523,6 +691,28 @@ def adopt_output(db_path: str, queue_id: int, output_path: str, tolerance_second
                 f"(tolerance {tolerance_seconds:.3f}s)"
             )
 
+        # Backfill SOURCE metadata for items that were staged before metadata
+        # capture existed, then capture the validated rendered OUTPUT before
+        # either file is moved or deleted.
+        reference_fp = fingerprint_file(reference)
+        store_probe_snapshot(
+            conn,
+            queue_id=queue_id,
+            path=reference,
+            fingerprint=reference_fp,
+            stage="SOURCE",
+            source_fingerprint=row["source_fingerprint"] or reference_fp,
+        )
+        rendered_fp = fingerprint_file(rendered)
+        store_probe_snapshot(
+            conn,
+            queue_id=queue_id,
+            path=rendered,
+            fingerprint=rendered_fp,
+            stage="OUTPUT",
+            source_fingerprint=row["source_fingerprint"] or reference_fp,
+        )
+
         # If it was already returned incorrectly, remove its incorrect completed footprint
         # and move the returned original back into staging before replacing it.
         if row["status"] == "RETURNED":
@@ -542,7 +732,7 @@ def adopt_output(db_path: str, queue_id: int, output_path: str, tolerance_second
                 staged.unlink()
             adopted = rendered
 
-        final_fp = fingerprint_file(adopted)
+        final_fp = rendered_fp if adopted == rendered else fingerprint_file(adopted)
         conn.execute(
             """
             UPDATE processing_queue

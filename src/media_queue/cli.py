@@ -5,7 +5,8 @@ import os
 import sys
 from pathlib import Path
 
-from .db import init_db
+from .db import connect, init_db
+from .metadata import metadata_stats
 from .service import (
     VIDEO_EXTENSIONS,
     add_file,
@@ -20,6 +21,8 @@ from .service import (
     reset_failed,
     return_file,
     scan_directory,
+    probe_scan_directory,
+    probe_queue_items,
 )
 
 
@@ -58,6 +61,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ext", action="append", help="Extension to include; repeatable")
     p.add_argument("--pipeline", default="default", help="Processing profile/footprint namespace")
 
+    p = sub.add_parser("probe-scan", help="Non-destructively collect ffprobe metadata without queueing or moving files")
+    p.add_argument("root")
+    p.add_argument("--min-size-gb", type=float, default=0)
+    p.add_argument("--ext", action="append", help="Extension to include; repeatable")
+
+    p = sub.add_parser("probe-queue", help="Non-destructively collect ffprobe metadata from existing queue rows")
+    p.add_argument("id", nargs="*", type=int, help="Optional queue IDs; omit to select by status")
+    p.add_argument("--status", default="READY_TO_MOVE", choices=["READY_TO_MOVE", "IN_PROCESSING", "READY_TO_RETURN", "RETURNED", "FAILED", "SKIPPED"])
+    p.add_argument("--limit", type=int, help="Maximum rows to probe when selecting by status")
+
     p = sub.add_parser("list", help="List queue items")
     p.add_argument("--status", choices=["READY_TO_MOVE", "IN_PROCESSING", "READY_TO_RETURN", "RETURNED", "FAILED", "SKIPPED"])
 
@@ -92,6 +105,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("id", type=int)
     p.add_argument("--to", default="READY_TO_MOVE", choices=["READY_TO_MOVE", "IN_PROCESSING", "READY_TO_RETURN"])
 
+    sub.add_parser("metadata-stats", help="Show captured media/Flow-enrichment metadata counts")
+
     return parser
 
 
@@ -117,6 +132,24 @@ def main() -> None:
                 pipeline=args.pipeline,
             )
             print(f"Queued/updated: {queued}; already processed: {processed}; skipped/errors: {errors}")
+
+        elif args.command == "probe-scan":
+            extensions = args.ext if args.ext else VIDEO_EXTENSIONS
+            minimum = int(args.min_size_gb * 1024**3)
+            captured, existing, errors = probe_scan_directory(
+                args.db, args.root, minimum, extensions
+            )
+            print(f"Metadata captured: {captured}; already captured: {existing}; skipped/errors: {errors}")
+
+        elif args.command == "probe-queue":
+            queue_ids = args.id if args.id else None
+            captured, existing, errors = probe_queue_items(
+                args.db,
+                status=args.status,
+                limit=args.limit,
+                queue_ids=queue_ids,
+            )
+            print(f"Metadata captured: {captured}; already captured: {existing}; skipped/errors: {errors}")
 
         elif args.command == "list":
             rows = list_items(args.db, args.status)
@@ -170,6 +203,17 @@ def main() -> None:
         elif args.command == "reset-failed":
             reset_failed(args.db, args.id, args.to)
             print(f"Item {args.id} reset to {args.to}")
+
+        elif args.command == "metadata-stats":
+            init_db(args.db)
+            with connect(args.db) as conn:
+                stats = metadata_stats(conn)
+            print(f"Assets:           {stats['assets']}")
+            print(f"Source snapshots: {stats['source_snapshots']}")
+            print(f"Output snapshots: {stats['output_snapshots']}")
+            print(f"Streams:          {stats['streams']}")
+            print(f"Flow pending:     {stats['flow_pending']}")
+            print(f"Flow complete:    {stats['flow_complete']}")
 
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
