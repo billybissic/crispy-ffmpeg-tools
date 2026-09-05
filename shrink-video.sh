@@ -192,7 +192,7 @@ done < <(
 )
 
 ffmpeg -i "$input" \
-  -map 0:v \
+  -map 0:v:0 \
   -map 0:a? \
   "${subtitle_args[@]}" \
   -map_metadata 0 \
