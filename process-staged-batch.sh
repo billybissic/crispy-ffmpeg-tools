@@ -328,8 +328,77 @@ for id in "${IDS[@]}"; do
     esac
   fi
 
-  (( rendered_bytes < staged_bytes )) || fail \
-    "Rendered output for item $id is not smaller than source"
+  if (( rendered_bytes >= staged_bytes )); then
+    savings_bytes=$((staged_bytes - rendered_bytes))
+
+    savings_percent=$(awk \
+       -v source="$staged_bytes" \
+       -v rendered="$rendered_bytes" \
+       'BEGIN {
+          printf "%.2f", ((source - rendered) / source) * 100
+        }')
+
+    reason="SKIPPED_INEFFICIENT|OUTPUT_NOT_SMALLER|source_bytes=${staged_bytes}|rendered_bytes=${rendered_bytes}|savings_percent=${savings_percent}"
+
+    echo
+    echo "      SKIP $id: rendered output is not smaller than source"
+    echo "      source:   $staged_bytes bytes"
+    echo "      rendered: $rendered_bytes bytes"
+    echo "      savings:  ${savings_percent}%"
+    echo "      reason:   OUTPUT_NOT_SMALLER"
+
+    #
+    # Rejected render is derived data and is intentionally discarded.
+    #
+    rm -f -- "$rendered_path" \
+      || fail "Could not remove rejected render: $rendered_path"
+
+    #
+    # Restore the untouched source to its original home.
+    #
+    [[ ! -e "$original_path" ]] || fail \
+      "Cannot restore skipped source; destination already exists: $original_path"
+
+    mv -- "$processing_path" "$original_path" \
+      || fail "Could not restore skipped source: $processing_path"
+
+    #
+    # SKIPPED is terminal for this pipeline. Keep the shared claim in place so
+    # another node does not pick the same source up and waste another encode.
+    #
+    sqlite3 "$DB" "
+      BEGIN IMMEDIATE;
+
+      UPDATE processing_queue
+      SET status='SKIPPED',
+          last_error='$reason',
+          updated_at=CURRENT_TIMESTAMP
+      WHERE id=$id
+        AND status='IN_PROCESSING';
+
+      INSERT INTO processing_events (
+        queue_id,
+        event_type,
+        detail
+      )
+      VALUES (
+        $id,
+        'SKIPPED_INEFFICIENT',
+        '$reason'
+      );
+
+      COMMIT;
+    " || fail "Could not mark item $id SKIPPED_INEFFICIENT"
+
+    ((failed_skipped+=1))
+
+    echo "      original restored"
+    echo "      rejected render removed"
+    echo "      item marked SKIPPED_INEFFICIENT"
+    echo
+
+    continue
+  fi
 
   # Preserve the no-overwrite contract before adopt-output removes the staged source.
   [[ ! -e "$expected_destination" ]] || fail \

@@ -21,3 +21,5 @@ shrink-results.csv
 # SQLite/runtime state
 *.swo
 *.swp
+
+.venv/
